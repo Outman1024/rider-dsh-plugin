@@ -25,13 +25,21 @@ class DshSessionManager(private val project: Project, private val api: DshApi) {
     /** List sessions; returns null when the host is unreachable or the call fails. */
     fun listSessions(): List<DshSessionSummary>? {
         val result = api.call("session.list", "{}", timeoutSeconds = 20)
-        if (!result.ok) return null
+        if (!result.ok) {
+            lastListFailure = result.error?.message ?: "session.list failed"
+            return null
+        }
+        lastListFailure = null
         val value = result.value ?: return emptyList()
         return value.arr("items").mapNotNull { item ->
             val summary = DshSessionSummary.parse(item)
             if (summary.sessionId.isEmpty()) null else summary
         }
     }
+
+    /** Underlying failure of the most recent session.list call, for diagnostics. */
+    var lastListFailure: String? = null
+        private set
 
     /**
      * Resolve the target session for the current project. Updates the persisted
@@ -40,7 +48,12 @@ class DshSessionManager(private val project: Project, private val api: DshApi) {
      */
     fun resolveSession(settings: DshSettings, forceNew: Boolean = false): Result<Resolved> {
         val items = listSessions()
-            ?: return Result.failure(ResolutionFailed("无法连接到 DeepSeek Harness（${api.normalizedBaseUrl}）。请确认已运行 dsh web。"))
+            ?: return Result.failure(
+                ResolutionFailed(
+                    "无法连接到 DeepSeek Harness（${api.normalizedBaseUrl}）：${lastListFailure}。"
+                        + "请确认已运行 dsh web，且端口与插件设置一致。",
+                ),
+            )
 
         val projectCwd = project.guessProjectDir()?.canonicalPath?.takeIf { it.isNotEmpty() }
         val cached = DshProjectState.getInstance(project).sessionId

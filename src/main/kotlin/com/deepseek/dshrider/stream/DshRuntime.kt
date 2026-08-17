@@ -72,20 +72,42 @@ class DshRuntime(private val project: Project) : Disposable {
     }
 
     private fun connectStream() {
-        if (disposed.get()) return
-        val api = api()
-        val handle = api.openEventStream(
-            onFrame = { frame -> routeFrame(frame) },
-            onDisconnect = { failure ->
+        if (disposed.get() || streamHandle.get() != null) return
+        // The WebSocket handshake blocks its caller; never do it on the EDT.
+        backgroundExecutor.executeOnPooledThread {
+            if (disposed.get() || streamHandle.get() != null) return@executeOnPooledThread
+            try {
+                val api = api()
+                val handle = api.openEventStream(
+                    onFrame = { frame -> routeFrame(frame) },
+                    onDisconnect = { failure ->
+                        conversationRef.get()?.let { conv ->
+                            ApplicationManager.getApplication().invokeLater {
+                                conv.setStatus(if (failure == null) "已断开，正在重连…" else "连接断开，正在重连…", false)
+                            }
+                        }
+                        scheduleReconnect()
+                    },
+                )
+                if (disposed.get()) {
+                    handle.close()
+                    return@executeOnPooledThread
+                }
+                streamHandle.set(handle)
+                reconnectDelayMs.set(2000L)
+                conversationRef.get()?.let { conv ->
+                    ApplicationManager.getApplication().invokeLater { conv.setStatus("已连接", true) }
+                }
+            } catch (e: Exception) {
+                // Handshake failed: report and fall into the reconnect cycle.
                 conversationRef.get()?.let { conv ->
                     ApplicationManager.getApplication().invokeLater {
-                        conv.setStatus(if (failure == null) "已断开，正在重连…" else "连接断开，正在重连…", false)
+                        conv.setStatus("连接失败，正在重试…", false)
                     }
                 }
                 scheduleReconnect()
-            },
-        )
-        streamHandle.set(handle)
+            }
+        }
     }
 
     private fun routeFrame(frame: com.deepseek.dshrider.wire.DshFrame) {

@@ -2,45 +2,51 @@ package com.deepseek.dshrider.api
 
 import com.deepseek.dshrider.wire.DshFrame
 import com.deepseek.dshrider.wire.DshRpcResult
+import com.deepseek.dshrider.wire.MiniJson
 import com.deepseek.dshrider.wire.clientRequestJson
 import com.deepseek.dshrider.wire.clientResponseJson
 import com.deepseek.dshrider.wire.parseServerResponse
-import java.io.BufferedReader
 import java.io.InputStream
-import java.io.InputStreamReader
+import java.net.HttpURLConnection
 import java.net.URI
+import java.net.URL
 import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
+import java.net.http.WebSocket
 import java.nio.charset.StandardCharsets
 import java.time.Duration
+import java.util.concurrent.CompletionStage
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Thin HTTP client for the DeepSeek Harness Web GUI API.
+ *
+ * Two deliberately chosen transports, both verified against a live host:
+ * - RPC calls (POST to the /api/&lt;method&gt; endpoints) use HttpURLConnection
+ *   (the synchronous Socket stack). On some Windows machines the JDK
+ *   HttpClient's async NIO stack gets RST by local loopback servers
+ *   ("HTTP/1.1 header parser received no bytes"), while the classic stack
+ *   works reliably.
+ * - The event stream uses the JDK WebSocket client against /api/events.mux
+ *   (the Web GUI's event transport is a WebSocket upgrade, not SSE).
+ *
  * Runs on background threads only; callers marshal results to the EDT.
  */
 class DshApi(baseUrl: String) {
 
     val normalizedBaseUrl: String = baseUrl.trim().trimEnd('/')
 
-    private val http: HttpClient = HttpClient.newBuilder()
+    private val wsClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
-        .followRedirects(HttpClient.Redirect.NEVER)
         .build()
 
     /** POST /api/<method> with the client-request envelope; returns the parsed server-response result. */
     fun call(method: String, payloadJson: String, timeoutSeconds: Long = 120): DshRpcResult {
         val body = clientRequestJson(method, payloadJson)
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create("$normalizedBaseUrl/api/$method"))
-            .timeout(Duration.ofSeconds(timeoutSeconds))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-            .build()
         return try {
-            val response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
-            parseServerResponse(response.body())
+            val conn = open("$normalizedBaseUrl/api/$method", timeoutSeconds)
+            conn.doOutput = true
+            conn.outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
+            readResponse(conn)
         } catch (e: Exception) {
             DshRpcResult.fail("network", e.message ?: e.javaClass.simpleName)
         }
@@ -49,17 +55,15 @@ class DshApi(baseUrl: String) {
     /** POST /api/respond with a client-response envelope. */
     fun respond(rpcId: String, valueJson: String, timeoutSeconds: Long = 30): DshRpcResult {
         val body = clientResponseJson(rpcId, valueJson)
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create("$normalizedBaseUrl/api/respond"))
-            .timeout(Duration.ofSeconds(timeoutSeconds))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-            .build()
         return try {
-            val response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
-            val root = com.deepseek.dshrider.wire.MiniJson.parseOrNull(response.body())?.asObj()
-            if (root != null && root.bool("accepted") == true) DshRpcResult.ok(null)
-            else DshRpcResult.fail("respond-rejected", root?.str("reason", "unknown") ?: "unknown")
+            val conn = open("$normalizedBaseUrl/api/respond", timeoutSeconds)
+            conn.doOutput = true
+            conn.outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
+            val code = conn.responseCode
+            val text = readAll(if (code >= 400) conn.errorStream else conn.inputStream)
+            val root = MiniJson.parseOrNull(text)?.asObj()
+            if (code in 200..299 && root != null && root.bool("accepted") == true) DshRpcResult.ok(null)
+            else DshRpcResult.fail("respond-rejected", root?.str("reason", "unknown") ?: "HTTP $code")
         } catch (e: Exception) {
             DshRpcResult.fail("network", e.message ?: e.javaClass.simpleName)
         }
@@ -69,62 +73,71 @@ class DshApi(baseUrl: String) {
     fun probe(): Boolean = call("session.list", "{}", timeoutSeconds = 5).ok
 
     /**
-     * Open one SSE connection to /api/events.mux.
-     * `onFrame` is invoked from a private reader thread for every parsed frame
-     * (one `data:` line); `onDisconnect` is invoked from the same thread when
-     * the stream ends (always exactly once, then the connection is closed).
-     * Returns a handle that force-closes the connection.
+     * Open one WebSocket connection to /api/events.mux (the GUI event transport).
+     * `onFrame` is invoked from the WebSocket receive thread for every parsed
+     * frame (one JSON text message); `onDisconnect` is invoked at most once when
+     * the socket closes or fails. Returns a handle that force-closes it.
      */
     fun openEventStream(
         onFrame: (DshFrame) -> Unit,
         onDisconnect: (Throwable?) -> Unit,
     ): DshEventStreamHandle {
         val closed = AtomicBoolean(false)
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create("$normalizedBaseUrl/api/events.mux"))
-            .timeout(Duration.ofMinutes(30))
-            .header("Accept", "text/event-stream")
-            .GET()
-            .build()
-        val thread = Thread({
-            var failure: Throwable? = null
-            try {
-                val response = http.send(request, HttpResponse.BodyHandlers.ofInputStream())
-                if (response.statusCode() != 200) {
-                    failure = IllegalStateException("HTTP ${response.statusCode()} from events.mux")
-                } else {
-                    readSse(response.body()) { line ->
-                        if (closed.get()) return@readSse false
-                        if (line.startsWith("data:")) {
-                            val data = line.removePrefix("data:").trim()
-                            if (data.isNotEmpty()) {
-                                val frame = DshFrame.parse(data)
-                                if (frame != null) onFrame(frame)
-                            }
-                        }
-                        true
-                    }
+        val finished = AtomicBoolean(false)
+        val wsUrl = normalizedBaseUrl.replaceFirst(Regex("^http"), "ws") + "/api/events.mux"
+        val socket = wsClient.newWebSocketBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .buildAsync(URI.create(wsUrl), object : WebSocket.Listener {
+                override fun onOpen(webSocket: WebSocket) {
+                    webSocket.request(1)
                 }
-            } catch (e: Exception) {
-                if (!closed.get()) failure = e
-            } finally {
-                if (!closed.get()) onDisconnect(failure)
-            }
-        }, "dsh-events-stream").apply {
-            isDaemon = true
-            start()
-        }
-        return DshEventStreamHandle { closed.set(true); thread.interrupt() }
+
+                override fun onText(webSocket: WebSocket, data: CharSequence, last: Boolean): CompletionStage<*>? {
+                    if (!closed.get() && !finished.get()) {
+                        val frame = DshFrame.parse(data.toString())
+                        if (frame != null) onFrame(frame)
+                    }
+                    if (!closed.get() && !finished.get()) webSocket.request(1)
+                    return null
+                }
+
+                override fun onClose(webSocket: WebSocket, statusCode: Int, reason: String): CompletionStage<*>? {
+                    if (finished.compareAndSet(false, true)) {
+                        onDisconnect(IllegalStateException("ws closed $statusCode: $reason"))
+                    }
+                    return null
+                }
+
+                override fun onError(webSocket: WebSocket, error: Throwable) {
+                    if (finished.compareAndSet(false, true)) onDisconnect(error)
+                }
+            }).join()
+        return DshEventStreamHandle { closed.set(true); socket.abort() }
     }
 
-    /** Read an SSE body line by line until EOF; the callback returning false stops reading. */
-    private fun readSse(input: InputStream, onLine: (String) -> Boolean) {
-        val reader = BufferedReader(InputStreamReader(input, StandardCharsets.UTF_8))
-        while (true) {
-            val line = try { reader.readLine() } catch (_: Exception) { null } ?: break
-            if (!onLine(line)) break
-        }
-        try { reader.close() } catch (_: Exception) { /* stream already gone */ }
+    private fun open(url: String, timeoutSeconds: Long): HttpURLConnection {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.setRequestProperty("Accept", "application/json, text/event-stream")
+        conn.connectTimeout = 10_000
+        conn.readTimeout = (timeoutSeconds * 1000).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        conn.useCaches = false
+        return conn
+    }
+
+    /** Business errors still arrive as HTTP 200; carrier failures use 4xx/5xx. */
+    private fun readResponse(conn: HttpURLConnection): DshRpcResult {
+        val code = conn.responseCode
+        val text = readAll(if (code >= 400) conn.errorStream else conn.inputStream)
+        if (code in 200..299) return parseServerResponse(text)
+        val head = text.trim().take(160).replace('\n', ' ')
+        return DshRpcResult.fail("network", "HTTP $code${if (head.isEmpty()) "" else ": $head"}")
+    }
+
+    private fun readAll(input: InputStream?): String {
+        if (input == null) return ""
+        return input.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
     }
 }
 
