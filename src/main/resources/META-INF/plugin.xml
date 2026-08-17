@@ -1,0 +1,68 @@
+<idea-plugin>
+    <id>com.deepseek.dsh-rider</id>
+    <name>DeepSeek Harness for Rider</name>
+    <vendor>DeepSeek Harness</vendor>
+
+    <description><![CDATA[
+      Connects JetBrains Rider to a locally running DeepSeek Harness Web GUI (dsh web, http://127.0.0.1:3080).
+
+      Select a file, a line, or a block of code in the editor and send it straight to your harness
+      with one click. Replies stream back into the dedicated "DeepSeek" tool window, where you can
+      also answer questions, allow or reject tool approvals, type follow-up prompts, and jump to the
+      full Web GUI at any time.
+
+      Features:
+      - "Ask DeepSeek" on editor selection / current line / whole file (context menu, Tools menu, Alt+Shift+D)
+      - Streaming assistant replies in the Rider tool window
+      - Approval cards (allow once / reject) and question cards answered without leaving Rider
+      - One persistent harness session per Rider project (session cwd = project root), reusable across restarts
+      - Configurable session policy, context size caps and default question template
+
+      Requires a running DeepSeek Harness Web GUI on this machine ("dsh web").
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="DeepSeek" anchor="right"
+                    factoryClass="com.deepseek.dshrider.ui.DshToolWindowFactory"/>
+        <applicationService serviceImplementation="com.deepseek.dshrider.settings.DshSettings"/>
+        <projectService serviceImplementation="com.deepseek.dshrider.session.DshProjectState"/>
+        <applicationConfigurable parentId="tools"
+                                 instance="com.deepseek.dshrider.settings.DshSettingsConfigurable"
+                                 id="com.deepseek.dshrider.settings"
+                                 displayName="DeepSeek Harness"/>
+        <notificationGroup displayType="BALLOON" id="Dsh.Notification"/>
+    </extensions>
+
+    <actions>
+        <action id="Dsh.AskSelection"
+                class="com.deepseek.dshrider.actions.AskSelectionAction"
+                text="Ask DeepSeek about Selection"
+                description="Send the selected code (or current line) with the file location to DeepSeek Harness">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="alt shift D"/>
+        </action>
+        <action id="Dsh.AskFile"
+                class="com.deepseek.dshrider.actions.AskFileAction"
+                text="Ask DeepSeek about File"
+                description="Send the current file reference (optionally its content) to DeepSeek Harness">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="Dsh.OpenWeb"
+                class="com.deepseek.dshrider.actions.OpenWebAction"
+                text="Open DeepSeek Harness Web GUI"
+                description="Open the DeepSeek Harness Web GUI in the default browser">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="Dsh.NewSession"
+                class="com.deepseek.dshrider.actions.NewSessionAction"
+                text="Start New DeepSeek Session"
+                description="Create a fresh harness session for this project">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

@@ -1,0 +1,17 @@
+# Build outputs
+build/
+.gradle/
+out/
+.intellijPlatform/
+
+# IDE
+.idea/
+*.iml
+
+# Local tool caches
+.build-tools/
+.gradle-home/
+
+# OS
+Thumbs.db
+.DS_Store
